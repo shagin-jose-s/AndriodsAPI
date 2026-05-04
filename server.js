@@ -10,22 +10,22 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ===== DATABASE ===== */
+/* ================= DATABASE ================= */
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-/* ===== TEST DB ===== */
-db.query("SELECT 1")
+db.connect()
   .then(() => console.log("✅ PostgreSQL Connected"))
-  .catch(err => console.error("❌ DB Error:", err));
+  .catch(err => console.error("❌ DB ERROR:", err.message));
 
-/* ===== MAIL (FIXED SMTP) ===== */
+/* ================= MAIL ================= */
+/* ⚠️ This WILL fail on Render sometimes (Gmail blocks servers) */
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
   port: 587,
-  secure: false, // IMPORTANT
+  secure: false,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS,
@@ -33,7 +33,7 @@ const transporter = nodemailer.createTransport({
   connectionTimeout: 10000
 });
 
-/* ===== OTP ===== */
+/* ================= OTP ================= */
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
@@ -44,10 +44,11 @@ app.post("/signup", async (req, res) => {
     let { email, username, password } = req.body;
 
     if (!email || !username || !password) {
-      return res.json({ success: false, message: "Missing fields" });
+      return res.status(400).json({ success: false, message: "Missing fields" });
     }
 
     email = email.toLowerCase().trim();
+    username = username.toLowerCase().trim();
 
     /* CHECK USER */
     const existing = await db.query(
@@ -59,17 +60,20 @@ app.post("/signup", async (req, res) => {
       return res.json({ success: false, message: "User already exists" });
     }
 
+    /* HASH PASSWORD */
     const hashedPassword = await bcrypt.hash(password, 10);
 
     /* INSERT USER */
     const result = await db.query(
-      "INSERT INTO users (email, username, password_hash, is_verified, role) VALUES ($1,$2,$3,$4,$5) RETURNING id",
+      `INSERT INTO users (email, username, password_hash, is_verified, role)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING id`,
       [email, username, hashedPassword, false, "intern"]
     );
 
     const userId = result.rows[0].id;
 
-    /* GENERATE OTP */
+    /* CREATE OTP */
     const otp = generateOTP();
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
@@ -78,36 +82,34 @@ app.post("/signup", async (req, res) => {
       [userId, otp, expiresAt]
     );
 
-    /* SEND EMAIL (SAFE) */
-    let emailSent = true;
+    /* SEND EMAIL (NON-BLOCKING SAFE) */
+    (async () => {
+      try {
+        await transporter.sendMail({
+          from: process.env.EMAIL_USER,
+          to: email,
+          subject: "Your OTP Code",
+          text: `Your OTP is ${otp}. It expires in 5 minutes.`,
+        });
 
-    try {
-      await transporter.sendMail({
-        from: process.env.EMAIL_USER,
-        to: email,
-        subject: "Your OTP Code",
-        text: `Your OTP is ${otp}. It expires in 5 minutes.`,
-      });
+        console.log("📧 Email sent to:", email);
+      } catch (err) {
+        console.error("❌ EMAIL FAILED:", err.message);
+      }
+    })();
 
-      console.log("📧 Email sent");
-    } catch (mailErr) {
-      console.error("❌ MAIL ERROR:", mailErr.message);
-      emailSent = false;
-    }
-
-    /* IMPORTANT: NEVER FAIL SIGNUP */
-    res.json({
+    /* ALWAYS SUCCESS */
+    return res.json({
       success: true,
-      message: emailSent
-        ? "Signup successful! OTP sent."
-        : "Signup successful! OTP generated (email failed)"
+      message: "Signup successful. OTP generated."
     });
 
   } catch (err) {
-    console.error("❌ SIGNUP ERROR:", err.message);
-    res.status(500).json({
+    console.error("🔥 SIGNUP ERROR FULL:", err);
+
+    return res.status(500).json({
       success: false,
-      message: "Server error"
+      message: err.message  // 👈 important for debugging
     });
   }
 });
@@ -118,7 +120,7 @@ app.post("/verifyotp", async (req, res) => {
     let { email, otp } = req.body;
 
     if (!email || !otp) {
-      return res.json({ success: false, message: "Missing fields" });
+      return res.status(400).json({ success: false, message: "Missing fields" });
     }
 
     email = email.toLowerCase().trim();
@@ -143,23 +145,17 @@ app.post("/verifyotp", async (req, res) => {
       return res.json({ success: false, message: "OTP invalid or expired" });
     }
 
-    await db.query(
-      "UPDATE users SET is_verified=TRUE WHERE id=$1",
-      [userId]
-    );
+    await db.query("UPDATE users SET is_verified=TRUE WHERE id=$1", [userId]);
+    await db.query("DELETE FROM otps WHERE user_id=$1", [userId]);
 
-    await db.query(
-      "DELETE FROM otps WHERE user_id=$1",
-      [userId]
-    );
-
-    res.json({ success: true, message: "Account verified!" });
+    return res.json({ success: true, message: "Account verified!" });
 
   } catch (err) {
-    console.error("❌ VERIFY ERROR:", err.message);
-    res.status(500).json({
+    console.error("🔥 VERIFY ERROR:", err);
+
+    return res.status(500).json({
       success: false,
-      message: "Server error"
+      message: err.message
     });
   }
 });
@@ -170,7 +166,7 @@ app.post("/login", async (req, res) => {
     let { username, password } = req.body;
 
     if (!username || !password) {
-      return res.json({ success: false, message: "Missing fields" });
+      return res.status(400).json({ success: false, message: "Missing fields" });
     }
 
     username = username.toLowerCase();
@@ -196,7 +192,7 @@ app.post("/login", async (req, res) => {
       return res.json({ success: false, message: "Invalid credentials" });
     }
 
-    res.json({
+    return res.json({
       success: true,
       user: {
         id: user.id,
@@ -206,20 +202,21 @@ app.post("/login", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ LOGIN ERROR:", err.message);
-    res.status(500).json({
+    console.error("🔥 LOGIN ERROR:", err);
+
+    return res.status(500).json({
       success: false,
-      message: "Server error"
+      message: err.message
     });
   }
 });
 
-/* ===== TEST ===== */
+/* ================= TEST ================= */
 app.get("/", (req, res) => {
   res.send("Server is working ✅");
 });
 
-/* ===== SERVER ===== */
+/* ================= SERVER ================= */
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, "0.0.0.0", () => {
