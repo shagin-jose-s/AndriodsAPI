@@ -1,45 +1,44 @@
 const express = require("express");
-const mysql = require("mysql2");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const nodemailer = require("nodemailer");
-require("dotenv").config(); //
+const { Pool } = require("pg");
+require("dotenv").config();
 
 const app = express();
-
-/* ===== DEBUG (CHECK ENV) ===== */
-console.log("EMAIL_USER:", process.env.EMAIL_USER);
-console.log("EMAIL_PASS:", process.env.EMAIL_PASS ? "Loaded" : "Missing");
 
 /* ===== MIDDLEWARE ===== */
 app.use(cors());
 app.use(express.json());
 
 /* ===== DATABASE ===== */
-const db = mysql.createPool({
-  host: process.env.DB_HOST || "localhost",
-  user: process.env.DB_USER || "root",
-  password: process.env.DB_PASSWORD || "",
-  database: process.env.DB_NAME || "test"
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-/* ===== MAIL SETUP ===== */
+/* ===== TEST DB ===== */
+db.query("SELECT 1")
+  .then(() => console.log("✅ PostgreSQL Connected"))
+  .catch(err => console.error("❌ DB Error:", err));
+
+/* ===== MAIL ===== */
 const transporter = nodemailer.createTransport({
-  service: "Gmail",
+  host: "smtp.gmail.com",
+  port: 587,
+  secure: false, // important
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
   }
 });
 
-/* ===== OTP FUNCTION ===== */
+/* ===== OTP ===== */
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-/* =====================================================
-   SIGNUP
-===================================================== */
+/* ================= SIGNUP ================= */
 app.post("/signup", async (req, res) => {
   try {
     let { email, username, password } = req.body;
@@ -50,56 +49,69 @@ app.post("/signup", async (req, res) => {
 
     email = email.toLowerCase().trim();
 
-    const emailRegex = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/;
-
-    if (!emailRegex.test(email)) {
-      return res.json({ success: false, message: "Invalid email format" });
-    }
-
-    const [existing] = await db.promise().query(
-      "SELECT id FROM users WHERE email = ? OR username = ?",
+    /* CHECK USER */
+    const existing = await db.query(
+      "SELECT id FROM users WHERE email = $1 OR username = $2",
       [email, username]
     );
 
-    if (existing.length > 0) {
+    if (existing.rows.length > 0) {
       return res.json({ success: false, message: "User already exists" });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    const [result] = await db.promise().query(
-      "INSERT INTO users (email, username, password_hash, is_verified, role) VALUES (?,?,?,?,?)",
+    /* INSERT USER */
+    const result = await db.query(
+      "INSERT INTO users (email, username, password_hash, is_verified, role) VALUES ($1,$2,$3,$4,$5) RETURNING id",
       [email, username, hashedPassword, false, "intern"]
     );
 
-    const userId = result.insertId;
+    const userId = result.rows[0].id;
 
+    /* GENERATE OTP */
     const otp = generateOTP();
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
-    await db.promise().query(
-      "INSERT INTO otps (user_id, otp, expires_at) VALUES (?,?,?)",
+    await db.query(
+      "INSERT INTO otps (user_id, otp, expires_at) VALUES ($1,$2,$3)",
       [userId, otp, expiresAt]
     );
 
-    await transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to: email,
-      subject: "Your OTP Code",
-      text: `Your OTP is ${otp}. It will expire in 5 minutes.`
+    /* SEND EMAIL (SAFE) */
+    let emailSent = true;
+
+    try {
+      await transporter.sendMail({
+        from: process.env.EMAIL_USER,
+        to: email,
+        subject: "Your OTP Code",
+        text: `Your OTP is ${otp}. It will expire in 5 minutes.`,
+      });
+      console.log("📧 Email sent");
+    } catch (mailErr) {
+      console.error("❌ MAIL ERROR:", mailErr);
+      emailSent = false;
+    }
+
+    /* ALWAYS SUCCESS */
+    res.json({
+      success: true,
+      message: emailSent
+        ? "Signup successful! OTP sent."
+        : "Signup successful! OTP generated (email failed)"
     });
 
-    res.json({ success: true, message: "Signup successful! OTP sent." });
-
   } catch (err) {
-    console.error("SIGNUP ERROR:", err);
-    res.status(500).json({ success: false });
+    console.error("❌ SIGNUP ERROR:", err);
+    res.status(500).json({
+      success: false,
+      message: err.message
+    });
   }
 });
 
-/* =====================================================
-   VERIFY OTP
-===================================================== */
+/* ================= VERIFY OTP ================= */
 app.post("/verifyotp", async (req, res) => {
   try {
     let { email, otp } = req.body;
@@ -110,47 +122,48 @@ app.post("/verifyotp", async (req, res) => {
 
     email = email.toLowerCase().trim();
 
-    const [userRows] = await db.promise().query(
-      "SELECT id FROM users WHERE email = ?",
+    const userRes = await db.query(
+      "SELECT id FROM users WHERE email = $1",
       [email]
     );
- 
-    if (userRows.length === 0) {
+
+    if (userRes.rows.length === 0) {
       return res.json({ success: false, message: "User not found" });
     }
 
-    const userId = userRows[0].id;
+    const userId = userRes.rows[0].id;
 
-    const [otpRows] = await db.promise().query(
-      "SELECT * FROM otps WHERE user_id = ? AND otp = ? AND expires_at > NOW()",
+    const otpRes = await db.query(
+      "SELECT * FROM otps WHERE user_id = $1 AND otp = $2 AND expires_at > NOW()",
       [userId, otp]
     );
 
-    if (otpRows.length === 0) {
+    if (otpRes.rows.length === 0) {
       return res.json({ success: false, message: "OTP invalid or expired" });
     }
 
-    await db.promise().query(
-      "UPDATE users SET is_verified = TRUE WHERE id = ?",
+    await db.query(
+      "UPDATE users SET is_verified = TRUE WHERE id = $1",
       [userId]
     );
 
-    await db.promise().query(
-      "DELETE FROM otps WHERE user_id = ?",
+    await db.query(
+      "DELETE FROM otps WHERE user_id = $1",
       [userId]
     );
 
     res.json({ success: true, message: "Account verified!" });
 
   } catch (err) {
-    console.error("VERIFY OTP ERROR:", err);
-    res.status(500).json({ success: false });
+    console.error("❌ VERIFY ERROR:", err);
+    res.status(500).json({
+      success: false,
+      message: err.message
+    });
   }
 });
 
-/* =====================================================
-   LOGIN
-===================================================== */
+/* ================= LOGIN ================= */
 app.post("/login", async (req, res) => {
   try {
     let { username, password } = req.body;
@@ -161,16 +174,16 @@ app.post("/login", async (req, res) => {
 
     username = username.toLowerCase();
 
-    const [rows] = await db.promise().query(
-      "SELECT * FROM users WHERE email = ? OR username = ?",
+    const result = await db.query(
+      "SELECT * FROM users WHERE email = $1 OR username = $2",
       [username, username]
     );
 
-    if (rows.length === 0) {
+    if (result.rows.length === 0) {
       return res.json({ success: false, message: "Invalid credentials" });
     }
 
-    const user = rows[0];
+    const user = result.rows[0];
 
     if (!user.is_verified) {
       return res.json({ success: false, message: "User not verified yet" });
@@ -192,25 +205,22 @@ app.post("/login", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("LOGIN ERROR:", err);
-    res.status(500).json({ success: false });
+    console.error("❌ LOGIN ERROR:", err);
+    res.status(500).json({
+      success: false,
+      message: err.message
+    });
   }
 });
 
-/* =====================================================
-   FORGOT PASSWORD ROUTES
-===================================================== */
-const forgotPasswordRoutes = require("./routes/forgotPassword");
-app.use("/", forgotPasswordRoutes(db, transporter));
-
-/* ===== TEST ROUTE ===== */
+/* ===== TEST ===== */
 app.get("/", (req, res) => {
   res.send("Server is working ✅");
 });
 
 /* ===== SERVER ===== */
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
