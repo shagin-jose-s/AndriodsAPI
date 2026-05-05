@@ -1,8 +1,8 @@
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
-const nodemailer = require("nodemailer");
 const { Pool } = require("pg");
+const { Resend } = require("resend");
 require("dotenv").config();
 
 const app = express();
@@ -16,22 +16,12 @@ const db = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-/* ===== TEST DB ===== */
 db.query("SELECT 1")
   .then(() => console.log("✅ PostgreSQL Connected"))
   .catch(err => console.error("❌ DB Error:", err));
 
-/* ===== MAIL (FIXED SMTP) ===== */
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false, // IMPORTANT
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-  connectionTimeout: 10000
-});
+/* ===== RESEND SETUP ===== */
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 /* ===== OTP ===== */
 function generateOTP() {
@@ -48,6 +38,7 @@ app.post("/signup", async (req, res) => {
     }
 
     email = email.toLowerCase().trim();
+    username = username.toLowerCase().trim();
 
     /* CHECK USER */
     const existing = await db.query(
@@ -59,11 +50,13 @@ app.post("/signup", async (req, res) => {
       return res.json({ success: false, message: "User already exists" });
     }
 
+    /* HASH PASSWORD */
     const hashedPassword = await bcrypt.hash(password, 10);
 
     /* INSERT USER */
     const result = await db.query(
-      "INSERT INTO users (email, username, password_hash, is_verified, role) VALUES ($1,$2,$3,$4,$5) RETURNING id",
+      `INSERT INTO users (email, username, password_hash, is_verified, role)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
       [email, username, hashedPassword, false, "intern"]
     );
 
@@ -78,24 +71,23 @@ app.post("/signup", async (req, res) => {
       [userId, otp, expiresAt]
     );
 
-    /* SEND EMAIL (SAFE) */
+    /* SEND EMAIL USING RESEND */
     let emailSent = true;
 
     try {
-      await transporter.sendMail({
-        from: process.env.EMAIL_USER,
+      await resend.emails.send({
+        from: process.env.EMAIL_FROM, // IMPORTANT
         to: email,
         subject: "Your OTP Code",
         text: `Your OTP is ${otp}. It expires in 5 minutes.`,
       });
 
-      console.log("📧 Email sent");
-    } catch (mailErr) {
-      console.error("❌ MAIL ERROR:", mailErr.message);
+      console.log("📧 Email sent via Resend");
+    } catch (err) {
+      console.error("❌ RESEND ERROR:", err.message);
       emailSent = false;
     }
 
-    /* IMPORTANT: NEVER FAIL SIGNUP */
     res.json({
       success: true,
       message: emailSent
@@ -104,7 +96,7 @@ app.post("/signup", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ SIGNUP ERROR:", err.message);
+    console.error("🔥 SIGNUP ERROR:", err.message);
     res.status(500).json({
       success: false,
       message: "Server error"
@@ -143,15 +135,8 @@ app.post("/verifyotp", async (req, res) => {
       return res.json({ success: false, message: "OTP invalid or expired" });
     }
 
-    await db.query(
-      "UPDATE users SET is_verified=TRUE WHERE id=$1",
-      [userId]
-    );
-
-    await db.query(
-      "DELETE FROM otps WHERE user_id=$1",
-      [userId]
-    );
+    await db.query("UPDATE users SET is_verified=TRUE WHERE id=$1", [userId]);
+    await db.query("DELETE FROM otps WHERE user_id=$1", [userId]);
 
     res.json({ success: true, message: "Account verified!" });
 
