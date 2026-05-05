@@ -1,8 +1,8 @@
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
+const nodemailer = require("nodemailer");
 const { Pool } = require("pg");
-const { Resend } = require("resend");
 require("dotenv").config();
 
 const app = express();
@@ -10,20 +10,30 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ================= DATABASE ================= */
+/* ===== DATABASE ===== */
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-db.connect()
+/* ===== TEST DB ===== */
+db.query("SELECT 1")
   .then(() => console.log("✅ PostgreSQL Connected"))
-  .catch(err => console.error("❌ DB ERROR:", err.message));
+  .catch(err => console.error("❌ DB Error:", err));
 
-/* ================= RESEND ================= */
-const resend = new Resend(process.env.RESEND_API_KEY);
+/* ===== MAIL (FIXED SMTP) ===== */
+const transporter = nodemailer.createTransport({
+  host: "smtp.gmail.com",
+  port: 587,
+  secure: false, // IMPORTANT
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+  connectionTimeout: 10000
+});
 
-/* ================= OTP ================= */
+/* ===== OTP ===== */
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
@@ -34,11 +44,10 @@ app.post("/signup", async (req, res) => {
     let { email, username, password } = req.body;
 
     if (!email || !username || !password) {
-      return res.status(400).json({ success: false, message: "Missing fields" });
+      return res.json({ success: false, message: "Missing fields" });
     }
 
     email = email.toLowerCase().trim();
-    username = username.toLowerCase().trim();
 
     /* CHECK USER */
     const existing = await db.query(
@@ -50,20 +59,17 @@ app.post("/signup", async (req, res) => {
       return res.json({ success: false, message: "User already exists" });
     }
 
-    /* HASH PASSWORD */
     const hashedPassword = await bcrypt.hash(password, 10);
 
     /* INSERT USER */
     const result = await db.query(
-      `INSERT INTO users (email, username, password_hash, is_verified, role)
-       VALUES ($1,$2,$3,$4,$5)
-       RETURNING id`,
+      "INSERT INTO users (email, username, password_hash, is_verified, role) VALUES ($1,$2,$3,$4,$5) RETURNING id",
       [email, username, hashedPassword, false, "intern"]
     );
 
     const userId = result.rows[0].id;
 
-    /* CREATE OTP */
+    /* GENERATE OTP */
     const otp = generateOTP();
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
@@ -72,31 +78,36 @@ app.post("/signup", async (req, res) => {
       [userId, otp, expiresAt]
     );
 
-    /* SEND EMAIL USING RESEND */
+    /* SEND EMAIL (SAFE) */
+    let emailSent = true;
+
     try {
-      await resend.emails.send({
-        from: "onboarding@resend.dev",
+      await transporter.sendMail({
+        from: process.env.EMAIL_USER,
         to: email,
         subject: "Your OTP Code",
-        html: `<h2>Your OTP is: ${otp}</h2><p>Valid for 5 minutes</p>`
+        text: `Your OTP is ${otp}. It expires in 5 minutes.`,
       });
 
-      console.log("📧 OTP sent to:", email);
-    } catch (err) {
-      console.error("❌ RESEND ERROR:", err.message);
+      console.log("📧 Email sent");
+    } catch (mailErr) {
+      console.error("❌ MAIL ERROR:", mailErr.message);
+      emailSent = false;
     }
 
-    return res.json({
+    /* IMPORTANT: NEVER FAIL SIGNUP */
+    res.json({
       success: true,
-      message: "Signup successful. OTP sent."
+      message: emailSent
+        ? "Signup successful! OTP sent."
+        : "Signup successful! OTP generated (email failed)"
     });
 
   } catch (err) {
-    console.error("🔥 SIGNUP ERROR:", err);
-
-    return res.status(500).json({
+    console.error("❌ SIGNUP ERROR:", err.message);
+    res.status(500).json({
       success: false,
-      message: err.message
+      message: "Server error"
     });
   }
 });
@@ -107,7 +118,7 @@ app.post("/verifyotp", async (req, res) => {
     let { email, otp } = req.body;
 
     if (!email || !otp) {
-      return res.status(400).json({ success: false, message: "Missing fields" });
+      return res.json({ success: false, message: "Missing fields" });
     }
 
     email = email.toLowerCase().trim();
@@ -132,17 +143,23 @@ app.post("/verifyotp", async (req, res) => {
       return res.json({ success: false, message: "OTP invalid or expired" });
     }
 
-    await db.query("UPDATE users SET is_verified=TRUE WHERE id=$1", [userId]);
-    await db.query("DELETE FROM otps WHERE user_id=$1", [userId]);
+    await db.query(
+      "UPDATE users SET is_verified=TRUE WHERE id=$1",
+      [userId]
+    );
 
-    return res.json({ success: true, message: "Account verified!" });
+    await db.query(
+      "DELETE FROM otps WHERE user_id=$1",
+      [userId]
+    );
+
+    res.json({ success: true, message: "Account verified!" });
 
   } catch (err) {
-    console.error("🔥 VERIFY ERROR:", err);
-
-    return res.status(500).json({
+    console.error("❌ VERIFY ERROR:", err.message);
+    res.status(500).json({
       success: false,
-      message: err.message
+      message: "Server error"
     });
   }
 });
@@ -153,7 +170,7 @@ app.post("/login", async (req, res) => {
     let { username, password } = req.body;
 
     if (!username || !password) {
-      return res.status(400).json({ success: false, message: "Missing fields" });
+      return res.json({ success: false, message: "Missing fields" });
     }
 
     username = username.toLowerCase();
@@ -179,7 +196,7 @@ app.post("/login", async (req, res) => {
       return res.json({ success: false, message: "Invalid credentials" });
     }
 
-    return res.json({
+    res.json({
       success: true,
       user: {
         id: user.id,
@@ -189,21 +206,20 @@ app.post("/login", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("🔥 LOGIN ERROR:", err);
-
-    return res.status(500).json({
+    console.error("❌ LOGIN ERROR:", err.message);
+    res.status(500).json({
       success: false,
-      message: err.message
+      message: "Server error"
     });
   }
 });
 
-/* ================= TEST ================= */
+/* ===== TEST ===== */
 app.get("/", (req, res) => {
   res.send("Server is working ✅");
 });
 
-/* ================= SERVER ================= */
+/* ===== SERVER ===== */
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, "0.0.0.0", () => {
